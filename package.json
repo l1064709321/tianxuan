@@ -1,0 +1,24 @@
+{
+  "name": "tianxuan",
+  "version": "0.1.0",
+  "description": "天玄 TianXuan — 多神经系统协同的小型语言模型 (Transformer + RNN 混合架构)",
+  "private": true,
+  "type": "commonjs",
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc -w",
+    "train": "npm run build && node dist/ml/train.js",
+    "generate": "npm run build && node dist/ml/generate.js",
+    "server": "npm run build && node dist/server/index.js",
+    "start": "npm run server"
+  },
+  "dependencies": {
+    "@tensorflow/tfjs-node": "^4.22.0",
+    "express": "^4.21.2"
+  },
+  "devDependencies": {
+    "@types/express": "^4.17.21",
+    "@types/node": "^22.10.0",
+    "typescript": "^5.7.0"
+  }
+}
