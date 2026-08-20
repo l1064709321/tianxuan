@@ -1,0 +1,7 @@
+node_modules/
+dist/
+sandbox/
+data/checkpoints/
+data/corpus.txt
+data/raw/
+data/vectorstore/

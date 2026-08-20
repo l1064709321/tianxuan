@@ -1,0 +1,135 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>天玄 TianXuan · 字符级小语言模型</title>
+  <style>
+    :root { color-scheme: dark; }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0; background: #0d1117; color: #e6edf3;
+      font: 15px/1.6 "PingFang SC", "Microsoft YaHei", sans-serif;
+    }
+    .wrap { max-width: 860px; margin: 0 auto; padding: 32px 20px 80px; }
+    h1 { font-size: 22px; margin: 0 0 4px; }
+    .sub { color: #8b949e; margin-bottom: 20px; }
+    .card { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 18px; margin-bottom: 16px; }
+    label { display: block; font-size: 13px; color: #8b949e; margin: 10px 0 4px; }
+    textarea, input, select {
+      width: 100%; background: #0d1117; color: #e6edf3; border: 1px solid #30363d;
+      border-radius: 6px; padding: 10px; font-size: 15px;
+    }
+    textarea { min-height: 72px; resize: vertical; }
+    .row { display: flex; gap: 12px; flex-wrap: wrap; }
+    .row > div { flex: 1; min-width: 160px; }
+    button {
+      margin-top: 14px; width: 100%; padding: 12px; font-size: 16px; cursor: pointer;
+      background: #238636; color: #fff; border: 0; border-radius: 8px;
+    }
+    button:disabled { opacity: .55; cursor: wait; }
+    .out { white-space: pre-wrap; word-break: break-all; }
+    .trace { margin-top: 10px; font-family: ui-monospace, monospace; font-size: 12px; color: #8b949e; }
+    .badge { color: #58a6ff; }
+    .err { color: #f85149; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>天玄 TianXuan</h1>
+    <div class="sub">字符级小语言模型 · MoD 深度路由 · 向量库与 L0 记忆直出 <span id="meta" class="badge"></span></div>
+
+    <div class="card" style="background:#161b22;border:1px solid #30363d;border-radius:8px;padding:18px;margin-bottom:16px">
+      <label>记忆库检索(向量库)</label>
+      <div class="row">
+        <div style="flex:3"><input id="q" placeholder="例如: 关羽" /></div>
+        <div style="flex:1"><button id="qgo" style="margin-top:0">检索</button></div>
+      </div>
+      <div class="trace" id="qout"></div>
+    </div>
+
+    <div class="card" style="background:#161b22;border:1px solid #30363d;border-radius:8px;padding:18px;margin-bottom:16px">
+      <label>提示词</label>
+      <textarea id="prompt">小明打开门</textarea>
+      <div class="row">
+        <div><label>生成长度</label><input id="maxLen" type="number" value="160" min="20" max="800" /></div>
+        <div><label>深度预算</label>
+          <select id="budget"><option value="2">自动(可扩深)</option><option value="1">浅路径(快)</option></select>
+        </div>
+        <div><label>温度</label><input id="temp" type="number" value="0.85" min="0.1" max="1.5" step="0.05" /></div>
+        <div><label>top-k</label><input id="topk" type="number" value="5" min="1" max="30" /></div>
+      </div>
+      <button id="go">生成</button>
+    </div>
+
+    <div class="card" style="background:#161b22;border:1px solid #30363d;border-radius:8px;padding:18px">
+      <div id="status">点击生成开始</div>
+      <div class="out" id="out"></div>
+      <div class="trace" id="trace"></div>
+    </div>
+  </div>
+
+  <script>
+    const $ = (id) => document.getElementById(id);
+    async function meta() {
+      try {
+        const r = await fetch("/api/health");
+        const m = await r.json();
+        if (m.ready) {
+          $("meta").textContent = `· ${(m.params / 1e3).toFixed(0)}K 参数 · 词表 ${m.vocabSize} · ${m.corpusTokens.toLocaleString()} 字符 · 向量 ${m.storeSize}`;
+        } else {
+          $("meta").textContent = "· 未训练";
+          $("status").textContent = "(服务端提示) " + m.message;
+        }
+      } catch { $("meta").textContent = "· 服务未连接"; }
+    }
+    $("go").onclick = async () => {
+      const btn = $("go");
+      btn.disabled = true;
+      btn.textContent = "生成中…";
+      $("out").textContent = "";
+      $("trace").textContent = "";
+      try {
+        const r = await fetch("/api/generate", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            prompt: $("prompt").value,
+            maxLen: Number($("maxLen").value),
+            budget: Number($("budget").value),
+            temperature: Number($("temp").value),
+            topK: Number($("topk").value),
+          }),
+        });
+        const d = await r.json();
+        if (d.error) { $("status").textContent = "错误: " + d.error; return; }
+        $("out").textContent = d.text;
+        const counts = {};
+        let mem = 0;
+        for (const x of d.routes) { counts["L" + x.depth] = (counts["L" + x.depth] || 0) + 1; if (x.memoryHit) mem++; }
+        $("trace").textContent = `路由: ${Object.entries(counts).map(([k, v]) => `${k}×${v}`).join(" ")} | 记忆直出 ${mem} | 耗时 ${d.ms}ms`;
+        $("status").textContent = "生成完成";
+      } catch (e) {
+        $("status").textContent = "错误: " + e.message;
+      } finally {
+        btn.disabled = false;
+        btn.textContent = "生成";
+      }
+    };
+    $("qgo").onclick = async () => {
+      const q = $("q").value.trim();
+      if (!q) return;
+      $("qout").textContent = "检索中…";
+      try {
+        const r = await fetch("/api/retrieve?q=" + encodeURIComponent(q));
+        const d = await r.json();
+        if (d.error) { $("qout").textContent = "错误: " + d.error; return; }
+        $("qout").textContent = d.hits.map((h, i) => `${i + 1}. [${h.score.toFixed(3)}] ${h.text.slice(0, 60)}…`).join("\n");
+      } catch (e) {
+        $("qout").textContent = "错误: " + e.message;
+      }
+    };
+    meta();
+  </script>
+</body>
+</html>

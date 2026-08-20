@@ -1,7 +1,7 @@
 {
   "name": "tianxuan",
   "version": "0.1.0",
-  "description": "天玄 TianXuan — 多神经系统协同的小型语言模型 (Transformer + RNN 混合架构)",
+  "description": "天玄 TianXuan — 多神经协同字符级小语言模型(纯 TS 内核 + 全局工作站 + MoD 路由 + 向量库记忆)",
   "private": true,
   "type": "commonjs",
   "scripts": {
@@ -9,8 +9,10 @@
     "dev": "tsc -w",
     "train": "npm run build && node dist/ml/train.js",
     "generate": "npm run build && node dist/ml/generate.js",
+    "ingest": "npm run build && node dist/ml/ingest.js",
     "server": "npm run build && node dist/server/index.js",
-    "start": "npm run server"
+    "start": "npm run server",
+    "station:demo": "npm run build && node dist/station/demo.js"
   },
   "dependencies": {
     "@tensorflow/tfjs-node": "^4.22.0",
