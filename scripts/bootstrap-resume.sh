@@ -4,7 +4,7 @@
 # 训练已在跑或无事可做 → 秒退, 不干扰。已挂 ~/.profile 与 ~/.bashrc。
 set -u
 
-ROOT="/root/天玄"
+ROOT="/home/aidlux/tianxuan"
 LOG="$ROOT/sandbox/logs/train-full.log"
 EV="$ROOT/sandbox/logs/train-events.log"
 CK="$ROOT/sandbox/ck-full-multi"

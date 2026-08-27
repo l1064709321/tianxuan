@@ -3,11 +3,11 @@
 #   每 WATCH_INTERVAL 秒巡检; 训练被系统冻结/杀死时 → 自动挂暂停标志并退出(不自动续跑)。
 #   恢复方式: rm -f /root/天玄/sandbox/logs/.train-paused && bash scripts/bootstrap-resume.sh
 #   判定冻结: 训练进程存在但日志超过 AGE_LIMIT 秒未写入。
-LOG="/root/天玄/sandbox/logs/train-full.log"
-EV="/root/天玄/sandbox/logs/train-events.log"
-ST="/root/天玄/sandbox/logs/train-watch.json"
-CK="/root/天玄/sandbox/ck-full-multi"
-FLAG="/root/天玄/sandbox/logs/.train-paused"
+LOG="/home/aidlux/tianxuan/sandbox/logs/train-full.log"
+EV="/home/aidlux/tianxuan/sandbox/logs/train-events.log"
+ST="/home/aidlux/tianxuan/sandbox/logs/train-watch.json"
+CK="/home/aidlux/tianxuan/sandbox/ck-full-multi"
+FLAG="/home/aidlux/tianxuan/sandbox/logs/.train-paused"
 INTERVAL="${WATCH_INTERVAL:-300}"
 AGE_LIMIT="${AGE_LIMIT:-3600}"
 

@@ -6,6 +6,8 @@ import { CharTokenizer } from "./tokenizer";
 import { CharGRU, CharGRUConfig } from "./gru";
 import { MAX_PARAMS } from "./model";
 import { mulberry32 } from "./rng";
+import { STDP } from "./stdp";
+import { STDA } from "./stda";
 
 function ts(): string {
   const d = new Date();
@@ -44,6 +46,10 @@ function main(): number {
   const attnBias = num("attnbias", 0) === 1;
   const mamba = num("mamba", 0) === 1;
   const cnn = num("cnn", 0) === 1;
+  const stdp = num("stdp", 0) === 1;
+  const stda = num("stda", 0) === 1;
+  const stdpRate = num("stdprate", 0.01);
+  const stdaRate = num("stdarate", 0.005);
   const ckptEvery = Math.max(10, num("ckpt", 50));
   const outDir = flag("out") ?? "data/checkpoints";
   const resumeDir = flag("resume");
@@ -65,6 +71,10 @@ function main(): number {
       vocab: string[];
       lastBatch?: number;
       t?: number;
+      stdp?: boolean;
+      stda?: boolean;
+      stdpRate?: number;
+      stdaRate?: number;
     };
     if (!fs.existsSync("data/corpus.txt")) {
       console.error("未找到 data/corpus.txt: 续训要求与原训练完全相同的语料,请先用原参数完整跑一次训练");
@@ -108,6 +118,13 @@ function main(): number {
     model.fixedAttnBias = attnBias;
   }
 
+  // 初始化 STDP / STDA 规则
+  const useStdp = stdp || (resumeDir !== null && fs.existsSync(path.join(resumeDir, "meta.json")) && ((JSON.parse(fs.readFileSync(path.join(resumeDir, "meta.json"), "utf-8") as any)).stdp ?? false));
+  const useStda = stda || (resumeDir !== null && fs.existsSync(path.join(resumeDir, "meta.json")) && ((JSON.parse(fs.readFileSync(path.join(resumeDir, "meta.json"), "utf-8") as any)).stda ?? false));
+  const stdpRule = useStdp ? new STDP(stdpRate) : null;
+  const stdaRule = useStda ? new STDA(stdaRate) : null;
+  console.log(`STDP=${useStdp ? "on(rate="+stdpRate+")" : "off"} STDA=${useStda ? "on(rate="+stdaRate+")" : "off"}`);
+
   const ids = tokenizer.encode(text);
   const params = model.paramCount();
   if (params > MAX_PARAMS) {
@@ -145,19 +162,32 @@ function main(): number {
       const batchSeqs: Array<{ ids: number[] }> = [];
       for (let b = 0; b < batch; b++) batchSeqs.push(trainSeqs[order[s * batch + b]]);
       const loss = model.trainStepBatch(batchSeqs, lr);
+      // STDP/STDA 后处理
+      if (stdpRule) {
+        stdpRule.apply(model.getGroups());
+        model.clearStdHist();
+      }
+      if (stdaRule && model._stdaLastH2) {
+        stdaRule.update(model._stdaLastH2);
+      }
       if (s % 40 === 0) {
         const sps = (s + 1) / ((Date.now() - t0) / 1000);
         console.log(`[${ts()}] [epoch ${baseEpochs + ep}/${totalEpochs}] 批 ${s + 1}/${stepCount} loss ${loss.toFixed(3)} (${sps.toFixed(1)} batch/s)`);
       }
-      // 周期检查点: 每 ckptEvery 批存一次, 进程被冻结/回收时最多丢 ckptEvery 批, 不整轮丢失
+  // 周期检查点: 每 ckptEvery 批存一次, 进程被冻结/回收时最多丢 ckptEvery 批, 不整轮丢失
       if (s > 0 && s % ckptEvery === 0) {
-        saveCheckpoint(outDir, model, tokenizer, params, text.length, baseEpochs + ep - 1, rawPerFile, s + 1);
+        saveCheckpoint(outDir, model, tokenizer, params, text.length, baseEpochs + ep - 1, rawPerFile, s + 1, {
+          stdp: useStdp, stda: useStda, stdpRate, stdaRate
+        });
         console.log(`  [${ts()}] [周期检查点] epoch ${baseEpochs + ep} 批 ${s}/${stepCount} 已保存 → ${outDir}`);
       }
     }
     const ev = evaluate(model, valSeqs, tokenizer);
-    console.log(`[${ts()}] epoch ${baseEpochs + ep} 完成 → 验证损失 ${ev.loss.toFixed(3)} | top-1 准确率 ${(ev.acc * 100).toFixed(1)}%` + (ev.recall !== null ? ` | 就后召回 ${(ev.recall * 100).toFixed(1)}%` : ""));
-    saveCheckpoint(outDir, model, tokenizer, params, text.length, baseEpochs + ep, rawPerFile, 0);
+    const stdaMeta = stdaRule ? { threshold: stdaRule.threshold.toFixed(4), activity: stdaRule.activity.toFixed(4) } : {};
+    console.log(`[${ts()}] epoch ${baseEpochs + ep} 完成 → 验证损失 ${ev.loss.toFixed(3)} | top-1 准确率 ${(ev.acc * 100).toFixed(1)}%` + (ev.recall !== null ? ` | 就后召回 ${(ev.recall * 100).toFixed(1)}%` : "") + (stdaRule ? ` | STDA阈值=${stdaRule.threshold.toFixed(4)} 活性=${stdaRule.activity.toFixed(4)}` : ""));
+    saveCheckpoint(outDir, model, tokenizer, params, text.length, baseEpochs + ep, rawPerFile, 0, {
+      stdp: useStdp, stda: useStda, stdpRate, stdaRate
+    });
   }
   console.log(`训练完成(共 ${totalEpochs} 轮),检查点已保存到 ` + path.resolve(outDir));
   return 0;
@@ -202,6 +232,7 @@ function saveCheckpoint(
   epochs: number,
   rawPerFile: number,
   lastBatch = 0,
+  extraMeta?: Record<string, unknown>,
 ): void {
   const meta = {
     config: model.cfg,
@@ -213,6 +244,7 @@ function saveCheckpoint(
     t: model.steps,
     vocab: tokenizer.charset(),
     trainedAt: new Date().toISOString(),
+    ...(extraMeta ?? {}),
   };
   fs.mkdirSync(dir, { recursive: true });
   // 原子写: 先写 .tmp 再 rename, 进程被 kill 时不会留下半截 model.json

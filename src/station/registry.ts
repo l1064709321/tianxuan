@@ -10,8 +10,8 @@ const SEED: NeuralSystem[] = [
   { kind: "kan", name: "KAN", role: "解码增强", stage: "deferred", enabled: false, status: "shelf", justification: "候选: 仅当解码精度出现可测缺口时评估", evidence: { metric: "解码 top-1", baseline: 0, result: 0, status: "pending" } },
   { kind: "moe", name: "MoE", role: "专家库", stage: "deferred", enabled: false, status: "shelf", justification: "否决: 官方(Switch)以超大参数为前提,10M 预算下无意义", evidence: { metric: "参数效率", baseline: 0, result: 0, status: "fail", note: "Switch 论文前提不成立" } },
   { kind: "snn", name: "SNN", role: "事件门控/稀疏唤醒", stage: "deferred", enabled: false, status: "shelf", justification: "否决: 收益绑定神经形态硬件,CPU+tfjs 无内核且训练不稳定", evidence: { metric: "CPU 能耗/收益", baseline: 0, result: 0, status: "fail", note: "CPU 文本世界无收益场景" } },
-  { kind: "stdp", name: "STDP", role: "突触权重可塑性规则", stage: "deferred", enabled: false, status: "shelf", justification: "否决: 无监督局部规则与端到端损失冲突", evidence: { metric: "端到端 loss", baseline: 0, result: 0, status: "fail" } },
-  { kind: "stda", name: "STDA", role: "兴奋性/阈值适应", stage: "deferred", enabled: false, status: "shelf", justification: "否决: 术语无文献;稀疏度用路由熵正则覆盖", evidence: { metric: "—", baseline: 0, result: 0, status: "fail", note: "无文献术语" } },
+  { kind: "stdp", name: "STDP", role: "突触权重可塑性规则", stage: "phase1", enabled: true, status: "idle", justification: "实验: 局部 Hebbian 相关性与端到端损失叠加, stdpRate=0.01", evidence: { metric: "端到端 loss + 局部相关性", baseline: 0, result: 0, status: "pending", note: "STDP 作为附加正则叠加 BPTT 梯度" } },
+  { kind: "stda", name: "STDA", role: "兴奋性/阈值适应", stage: "phase1", enabled: true, status: "idle", justification: "实验: 基于 h2 激活的滑动平均自适应输出头衰减, tau=50", evidence: { metric: "—", baseline: 0, result: 0, status: "pending", note: "STDA 与路由熵正则互补作用于不同层级" } },
 ];
 
 /** 注册中心: 系统进站登记,enabled 前必须通过 justification 门槛 */

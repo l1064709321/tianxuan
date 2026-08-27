@@ -257,6 +257,25 @@ export class CharGRU {
     this.t = Math.max(1, Math.floor(t));
   }
 
+  /** STDP/STDA 用的当前批次 h1 历史(最近 bptt 步) */
+  _stdpH1Hist: Float64Array[] = [];
+  /** STDP/STDA 用的当前批次 pre 历史(最近 bptt 步) */
+  _stdpPreHist: Float64Array[] = [];
+  /** STDA 用的最近 h2 向量(供外部统计) */
+  _stdaLastH2: Float64Array | null = null;
+
+  /** 供 STDP 等外部规则访问参数组(避免直接暴露私有字段) */
+  getGroups(): Group[] {
+    return this.groups;
+  }
+
+  /** 每批训练后清空 STDP/STDA 历史记录 */
+  clearStdHist(): void {
+    this._stdpH1Hist = [];
+    this._stdpPreHist = [];
+    this._stdaLastH2 = null;
+  }
+
   constructor(cfg: CharGRUConfig, seed = 42) {
     this.cfg = cfg;
     const gaussian = makeGaussian(mulberry32(seed));
@@ -832,8 +851,16 @@ export class CharGRU {
         for (let e = 0; e < E; e++) this.emb.g[(seq.ids[t] % V) * E + e] += dx1[e];
         dH1Next.set(dH1Prev);
       }
+      // 记录本批次的 h1 历史供 STDP 使用（z1t = 遗忘门激活 ≈ 突触前信号）
+      for (let si = 0; si < h1t.length; si++) {
+        this._stdpH1Hist.push(h1t[si]);
+        this._stdpPreHist.push(z1t[si]);
+      }
+      // STDA: 记录最后一个时间步的 h2
+      if (h2t.length > 0) {
+        this._stdaLastH2 = Array.isArray(h2t[h2t.length - 1]) ? (h2t[h2t.length - 1] as Float64Array) : h2t[h2t.length - 1];
+      }
     }
-    if (totalChars === 0) return 0;
     for (const g of this.groups) {
       for (let i = 0; i < g.g.length; i++) g.g[i] /= totalChars;
     }
