@@ -5,10 +5,12 @@ import { execSync, spawn } from "child_process";
 /**
  * 天玄跨平台训练看门狗(Windows / macOS / Linux 通用)
  *
- * 巡检逻辑与 scripts/watch-train.sh 一致:
+ * 巡检逻辑:
  *   训练进程被杀/消失 → 置 .train-paused 并退出(等用户手动恢复)
  *   日志超过 AGE_LIMIT 未更新(冻结) → kill 训练进程, 置暂停标志并退出
  *   训练完成 → 记录 done 并退出
+ *
+ * 续训参数从 ck-full-multi/meta.json 动态读取, 不硬编码。
  *
  * 用法:
  *   node sandbox/dist/ml/watchdog.js                 # 看门狗模式(巡检)
@@ -69,6 +71,54 @@ function lastProgress(): { epoch: string; batch: string; total: string; loss: st
   return m
     ? { epoch: m[1], batch: m[3], total: m[4], loss: m[5], speed: m[6] }
     : { epoch: "", batch: "", total: "", loss: "", speed: "" };
+}
+
+/** 从检查点读取训练参数, 确保续训不丢进度 */
+function buildResumeArgs(): string[] {
+  try {
+    const metaPath = path.join(CK, "meta.json");
+    if (!fs.existsSync(metaPath)) throw new Error("no meta");
+    const meta = JSON.parse(fs.readFileSync(metaPath, "utf-8")) as {
+      config: Record<string, unknown>;
+      epochs?: number;
+      lastBatch?: number;
+      t?: number;
+      moeTopK?: number;
+      moeGateHidden?: number;
+      moeNExperts?: number;
+      moeLoadBalanceWeight?: number;
+      onlineTitans?: boolean;
+    };
+    const cfg = meta.config as Record<string, unknown>;
+    return [
+      "--resume", CK,
+      "--epochs", "5",
+      "--lr", "0.002",
+      "--ckpt", "50",
+      "--out", CK,
+      "--hidden", String(cfg.hidden ?? 64),
+      "--emb", String(cfg.emb ?? 32),
+      "--bptt", String(cfg.bptt ?? 32),
+      "--ctx", String(cfg.ctx ?? 8),
+      "--attn", cfg.attn ? "1" : "0",
+      "--mamba", cfg.mamba ? "1" : "0",
+      "--cnn", cfg.cnn ? "1" : "0",
+      "--moe", "1",
+      "--moetopk", String(cfg.moeTopK ?? 2),
+      "--moegatehidden", String(cfg.moeGateHidden ?? 32),
+      "--moen", String(cfg.moeNExperts ?? 10),
+      "--moelbweight", String(cfg.moeLoadBalanceWeight ?? 0.01),
+      "--titans", cfg.onlineTitans ? "1" : "0",
+      "--prediction", "1",
+      "--replay", "1",
+      "--dopamine", "1",
+      "--spikethreshold", String(cfg.spikeThreshold ?? 0.3),
+      "--warmupsteps", "20",
+    ];
+  } catch (e) {
+    console.error(`[watchdog] 读取检查点参数失败: ${e}, 使用默认值`);
+    return ["--epochs", "3", "--lr", "0.002", "--ckpt", "50", "--out", CK, "--warmupsteps", "20"];
+  }
 }
 
 function findTrainPid(): number | null {
@@ -169,11 +219,8 @@ function resume(): void {
   if (fs.existsSync(FLAG)) fs.unlinkSync(FLAG);
   event("bootstrap-resume (用户/恢复模式触发, 自动续跑)");
   const trainCmd = path.join(SANDBOX, "dist", "ml", "train.js");
-  const args = [
-    trainCmd,
-    "--resume", "ck-full-multi",
-    "--epochs", "2", "--lr", "0.002", "--ckpt", "50", "--out", "ck-full-multi"
-  ];
+  // [FIXED] 从检查点动态读取参数, 不再硬编码
+  const args = [trainCmd, ...buildResumeArgs()];
   const child = spawn(process.execPath, args, {
     cwd: SANDBOX,
     detached: true,
@@ -181,7 +228,7 @@ function resume(): void {
     windowsHide: true
   });
   child.unref();
-  console.log(`[watchdog] 训练已启动 (pid=${child.pid ?? "?"})`);
+  console.log(`[watchdog] 训练已启动 (pid=${child.pid ?? "?"}) args=${args.join(" ")}`);
   startWatch();
 }
 

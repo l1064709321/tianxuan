@@ -32,7 +32,7 @@ for entry in "${BOOKS[@]}"; do
   url="https://www.gutenberg.org/cache/epub/${pid}/pg${pid}.txt"
   tmp="$OUT/.${name}.tmp"
   echo "==> 拉取 ${name} (pg${pid})"
-  if curl -fsSL --retry 5 --retry-delay 2 --retry-all-errors --max-time 180 \
+  if curl -fsSL --retry 5 --retry-delay 2 --max-time 180 \
       -A "TianXuanCorpus/0.1 (data pipeline)" "$url" -o "$tmp"; then
     if head -c 200 "$tmp" | iconv -f utf-8 -t utf-8 >/dev/null 2>&1; then
       size=$(wc -c < "$tmp")

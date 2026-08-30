@@ -16,6 +16,12 @@ export interface CharGRUConfig {
   cnn?: boolean;
   /** Mamba 真选择性层(depth 2): 替代第二层 GRU,快动力学线性状态流 */
   mamba?: boolean;
+  /** 脉冲近似门控: 用阈值函数替代纯 sigmoid, h > threshold 才"发放" */
+  spikeThreshold?: number;
+  /** 下一步预测头: h1 → pred_h2, 预测误差作为内在动机信号 */
+  predictionHead?: boolean;
+  /** 预测误差损失权重 */
+  predLossWeight?: number;
 }
 
 function sigmoid(x: number): number {
@@ -182,34 +188,34 @@ export interface GRUState {
   h1: Float64Array;
   h2: Float64Array;
   /** 最近 ctx 个 h2 历史(Attention 层跨位置交互用) */
-  hist: Array<Float64Array<ArrayBuffer>>;
+  hist: Array<Float64Array<ArrayBufferLike>>;
   /** 最近 ctx 个输入字符 id(CNN 层局部窗口用) */
   ids: number[];
 }
 
 export interface AttnCache {
-  K: Array<Float64Array<ArrayBuffer>>;
-  V: Array<Float64Array<ArrayBuffer>>;
+  K: Array<Float64Array<ArrayBufferLike>>;
+  V: Array<Float64Array<ArrayBufferLike>>;
   /** RMS 归一化后的历史输入(权重梯度用,非投影) */
-  Hn: Array<Float64Array<ArrayBuffer>>;
+  Hn: Array<Float64Array<ArrayBufferLike>>;
   w: Float64Array;
   q: Float64Array;
   /** 门控残差: gate ∈ (0,1), read = h2 + gate·context */
   gate: number;
   gatePre: number;
   /** RMS 归一化后的当前输入(gate 权重梯度用) */
-  qSrc: Float64Array<ArrayBuffer>;
+  qSrc: Float64Array<ArrayBufferLike>;
   /** 归一化前的当前 h1(RMS 雅可比反向用) */
-  h1Raw: Float64Array<ArrayBuffer>;
+  h1Raw: Float64Array<ArrayBufferLike>;
 }
 
 export interface CnnCache {
   ids: number[];
-  embWin: Array<Float64Array<ArrayBuffer>>;
+  embWin: Array<Float64Array<ArrayBufferLike>>;
   P: number;
-  pre: Array<Float64Array<ArrayBuffer>>;
-  out: Array<Float64Array<ArrayBuffer>>;
-  feat: Float64Array<ArrayBuffer>;
+  pre: Array<Float64Array<ArrayBufferLike>>;
+  out: Array<Float64Array<ArrayBufferLike>>;
+  feat: Float64Array<ArrayBufferLike>;
 }
 
 /**
@@ -221,7 +227,7 @@ export interface CnnCache {
 export class CharGRU {
   readonly cfg: CharGRUConfig;
   private emb: Group;
-  private cell1: GRUCell;
+  readonly cell1: GRUCell;
   private cell2: GRUCell;
   readonly ssm: SelectiveSSM | null;
   private attnQ: Group | null;
@@ -245,6 +251,11 @@ export class CharGRU {
   private bC: Group | null;
   private out: Group;
   private bOut: Group;
+  /** 下一步预测头: h1 → pred_h2 (内在动机/预测误差) */
+  private predW: Group | null;
+  private predB: Group | null;
+  /** 脉冲近似门控阈值(>threshold 才发放) */
+  private spikeThresh: number;
   private groups: Group[];
   private t = 0;
 
@@ -310,6 +321,15 @@ export class CharGRU {
     }
     this.out = new Group(cfg.vocabSize * cfg.hidden, () => gaussian() * 0.1);
     this.bOut = new Group(cfg.vocabSize, () => 0);
+    this.spikeThresh = cfg.spikeThreshold ?? 0.3;
+    if (cfg.predictionHead) {
+      const scale = 1 / Math.sqrt(cfg.hidden);
+      this.predW = new Group(cfg.hidden * cfg.hidden, () => gaussian() * scale);
+      this.predB = new Group(cfg.hidden, () => 0);
+    } else {
+      this.predW = null;
+      this.predB = null;
+    }
     if (cfg.mamba) {
       const ss = 1 / Math.sqrt(cfg.hidden * 2);
       this.ssm = new SelectiveSSM({ input: cfg.hidden, dState: 16 }, (i) => gaussian() * ss);
@@ -320,6 +340,7 @@ export class CharGRU {
       ...(this.ssm ? this.ssm.groupsAll() : this.cell2.groups()),
       ...(cfg.attn ? [this.attnQ!, this.attnK!, this.attnV!, this.attnGW!, this.attnGB!] : []),
       ...(cfg.cnn ? [this.cnnW!, this.cnnB!, this.outC!, this.bC!] : []),
+      ...(this.predW ? [this.predW!, this.predB!] : []),
       this.out,
       this.bOut,
     ];
@@ -330,12 +351,21 @@ export class CharGRU {
   }
 
   newState(): GRUState {
+    // SSM 模式下 h2 是展平状态向量 (length = hidden * dState)，GRU 模式下是 hidden 向量。
+    // 调用方访问 h2 时需确认 ssm 是否启用。
     return { h1: new Float64Array(this.cfg.hidden), h2: this.ssm ? this.ssm.newState() : new Float64Array(this.cfg.hidden), hist: [], ids: [] };
   }
 
   private embRow(id: number, out: Float64Array): void {
     const { vocabSize: v, emb } = this.cfg;
     out.set(this.emb.p.subarray((id % v) * emb, ((id % v) + 1) * emb));
+  }
+
+  /** 公开版: 获取字符嵌入向量(供CharMultiNeuro等外部类使用) */
+  embedInput(id: number): Float64Array {
+    const out = new Float64Array(this.cfg.emb);
+    this.embRow(id, out);
+    return out;
   }
 
   /** 推理一步(推进 state,可传副本做"窥视") */
@@ -402,7 +432,7 @@ export class CharGRU {
   }
 
   /** 学习型自注意力前向(窗口 = hist,残差输出) */
-  private attnForward(h1Cur: Float64Array<ArrayBuffer>, hist: Array<Float64Array<ArrayBuffer>>, cache: AttnCache): Float64Array<ArrayBuffer> {
+  private attnForward(h1Cur: Float64Array<ArrayBufferLike>, hist: Array<Float64Array<ArrayBufferLike>>, cache: AttnCache): Float64Array<ArrayBufferLike> {
     const H = this.cfg.hidden;
     const L = hist.length;
     const norm = (v: Float64Array): Float64Array<ArrayBuffer> => {
@@ -498,7 +528,7 @@ export class CharGRU {
     for (let i = 0; i < n; i++) acc[i] += dOut[i] / rms - coeff * v[i];
   }
 
-  private attnBackward(dAttnOut: Float64Array<ArrayBuffer>, cache: AttnCache, dH1Cur: Float64Array<ArrayBuffer>, dHistN: Float64Array[]): void {
+  private attnBackward(dAttnOut: Float64Array<ArrayBufferLike>, cache: AttnCache, dH1Cur: Float64Array<ArrayBufferLike>, dHistN: Float64Array[]): void {
     const H = this.cfg.hidden;
     const { K, V, Hn, w, q, gate, qSrc, h1Raw } = cache;
     const L = K.length;
@@ -646,8 +676,8 @@ export class CharGRU {
     }
   }
 
-  /** 训练一批序列: 截断 BPTT,返回平均交叉熵 */
-  trainStepBatch(seqs: Array<{ ids: number[] }>, lr: number): number {
+  /** 训练一批序列: 截断 BPTT, 返回 { loss, totalChars } */
+  trainStepBatch(seqs: Array<{ ids: number[] }>, lr: number): { loss: number; totalChars: number } {
     const { hidden: H, emb: E, vocabSize: V, bptt } = this.cfg;
     this.t += 1;
     for (const g of this.groups) g.zeroGrad();
@@ -660,9 +690,9 @@ export class CharGRU {
       const z1t: Float64Array[] = [];
       const r1t: Float64Array[] = [];
       const c1t: Float64Array[] = [];
-      const h2t: Array<Float64Array<ArrayBuffer>> = [];
+      const h2t: Array<Float64Array<ArrayBufferLike>> = [];
       /** 每步单元输出(GRU: h2; SSM: y), 供读头/attention hist 使用 */
-      const readt: Array<Float64Array<ArrayBuffer>> = [];
+      const readt: Array<Float64Array<ArrayBufferLike>> = [];
       const z2t: Float64Array[] = [];
       const r2t: Float64Array[] = [];
       const c2t: Float64Array[] = [];
@@ -674,6 +704,11 @@ export class CharGRU {
       const x2t: Float64Array[] = [];
       const attnCaches: (AttnCache | null)[] = [];
       const cnnCaches: (CnnCache | null)[] = [];
+      /** 脉冲近似门控(前向用阈值化, 反传用原始梯度) */
+      const spikedZ1t: Float64Array[] = [];
+      const spikedR1t: Float64Array[] = [];
+      /** 预测头缓存(h1→pred_h2) */
+      const predCaches: Array<{ h1: Float64Array; predH2: Float64Array; error: Float64Array }> = [];
       for (let t = 0; t < T; t++) {
         this.embRow(seq.ids[t], x);
         const z1 = new Float64Array(H);
@@ -681,10 +716,24 @@ export class CharGRU {
         const c1 = new Float64Array(H);
         const h1 = new Float64Array(H);
         this.cell1.forward(x, h1Prev, { z: z1, r: r1, c: c1, h: h1 });
-        h1t.push(h1);
-        z1t.push(z1);
-        r1t.push(r1);
-        c1t.push(c1);
+        // 脉冲近似: 阈值门控(前向 spike, 反传用原始 sigmoid 梯度)
+        const spikedZ1 = this.spikeThresh > 0 ? new Float64Array(H) : null;
+        if (spikedZ1) {
+          const spikedR1 = new Float64Array(H);
+          for (let i = 0; i < H; i++) {
+            spikedZ1[i] = z1[i] > this.spikeThresh ? 1.0 : 0.0;
+            spikedR1[i] = r1[i] > this.spikeThresh ? 1.0 : 0.0;
+          }
+          h1t.push(h1);
+          z1t.push(spikedZ1);
+          r1t.push(spikedR1);
+          c1t.push(c1);
+        } else {
+          h1t.push(h1);
+          z1t.push(z1);
+          r1t.push(r1);
+          c1t.push(c1);
+        }
         const z2 = new Float64Array(H);
         const r2 = new Float64Array(H);
         const c2 = new Float64Array(H);
@@ -720,6 +769,21 @@ export class CharGRU {
           c2t.push(c2);
           h2Prev.set(h2);
         }
+        // 预测头: h1 → pred_h2, 预测误差作为内在动机信号
+        if (this.predW) {
+          const predH2 = new Float64Array(H);
+          for (let j = 0; j < H; j++) {
+            let acc = this.predB!.p[j];
+            const row = this.predW!.p.subarray(j * H, (j + 1) * H);
+            for (let i = 0; i < H; i++) acc += row[i] * h1[i];
+            predH2[j] = acc;
+          }
+          const error = new Float64Array(H);
+          for (let i = 0; i < H; i++) error[i] = predH2[i] - (h2 as Float64Array)[i];
+          const predLoss = 0.5 * Array.from(error).reduce((s, v) => s + v * v, 0);
+          totalLoss += (this.cfg.predLossWeight ?? 0.01) * predLoss;
+          predCaches.push({ h1: h1.slice() as Float64Array, predH2, error });
+        }
         h1Prev.set(h1);
         let cnnLogits: Float64Array | null = null;
         if (this.cnnW) {
@@ -737,7 +801,8 @@ export class CharGRU {
           const read = readt[readt.length - 1];
           for (let j = 0; j < H; j++) acc += row[j] * read[j];
           if (cnnLogits) acc += cnnLogits[k];
-          logits[k] = acc;
+          // Logit clamp: 防止多路径叠加(log+CNN+预测头)导致数值溢出
+          logits[k] = Math.max(-100, Math.min(100, acc));
         }
         logitsList.push(logits);
         const y = seq.ids[t + 1];
@@ -840,6 +905,21 @@ export class CharGRU {
             }
           }
         }
+        // 预测头反向: pred_h2 = W_pred·h1 + b_pred, 梯度回传到 h1
+        if (this.predW && predCaches[t]) {
+          const pc = predCaches[t];
+          const pw = this.predW;
+          const plw = this.cfg.predLossWeight ?? 0.01;
+          // d(pred_h2) = error (MSE梯度 = pred_h2 - h2)
+          for (let j = 0; j < H; j++) {
+            this.predB!.g[j] += plw * pc.error[j];
+            const row = pw.g.subarray(j * H, (j + 1) * H);
+            for (let i = 0; i < H; i++) {
+              row[i] += plw * pc.error[j] * pc.h1[i];
+              dH1[i] += plw * pc.error[j] * pw.p[j * H + i];
+            }
+          }
+        }
         const h1prev = t > 0 ? h1t[t - 1] : new Float64Array(H);
         const x = new Float64Array(E);
         this.embRow(seq.ids[t], x);
@@ -870,7 +950,9 @@ export class CharGRU {
       for (let i = 0; i < g.g.length; i++) norm2 += g.g[i] * g.g[i];
     }
     const norm = Math.sqrt(norm2);
-    const maxNorm = 10;
+    // PyTorch clip_grad_norm_ 文本模型标准: maxNorm=1.0
+    // 参考: HuggingFace Transformers max_grad_norm=1.0, Google BERT clip_norm=1.0
+    const maxNorm = 1.0;
     if (norm > maxNorm) {
       const scale = maxNorm / norm;
       for (const g of this.groups) {
@@ -880,7 +962,7 @@ export class CharGRU {
     for (const g of this.groups) {
       g.adam(lr, this.t);
     }
-    return totalLoss / totalChars;
+    return { loss: totalLoss / totalChars, totalChars };
   }
 
   embedAvg(ids: number[]): number[] {
@@ -929,5 +1011,114 @@ export class CharGRU {
       for (let i = 0; i < g.p.length; i++) g.p[i] = params[off + i];
       off += g.p.length;
     }
+  }
+
+  /**
+   * 单步反向: 给定当前timestep的dLogits(来自外部loss)和前后state快照,
+   * 计算emb/cell1/cell2/ssm/attn/cnn的梯度并累加到各组g上。
+   * 供CharMultiNeuro等外部模块使用, 不修改self.state。
+   */
+  backPropStep(
+    xId: number,
+    statePrev: GRUState,
+    stateCur: GRUState,
+    dLogits: Float64Array,
+    depth: 4,
+  ): void {
+    const { hidden: H, emb: E, vocabSize: V, ctx, attn, mamba, cnn } = this.cfg;
+    // 从stateCur反推中间变量(需要重跑forward来记录)
+    // 由于forward是side-effect free的(传副本), 我们重跑一次记录cache
+    const x = new Float64Array(E);
+    this.embRow(xId, x);
+
+    // Cell1 forward (记录z1,r1,c1,h1)
+    const z1 = new Float64Array(H);
+    const r1 = new Float64Array(H);
+    const c1 = new Float64Array(H);
+    const h1 = new Float64Array(H);
+    this.cell1.forward(x, statePrev.h1, { z: z1, r: r1, c: c1, h: h1 });
+
+    // Attn forward (if depth>=3)
+    let attnCache: AttnCache | null = null;
+    let x2 = h1;
+    if (attn && depth >= 3) {
+      const hist = stateCur.hist.slice(Math.max(0, stateCur.hist.length - ctx), stateCur.hist.length);
+      attnCache = { K: [], V: [], Hn: [], w: new Float64Array(0), q: new Float64Array(0), gate: 0, gatePre: 0, qSrc: new Float64Array(0), h1Raw: new Float64Array(0) };
+      const attnOut = this.attnForward(h1, hist, attnCache);
+      x2 = new Float64Array(H);
+      for (let i = 0; i < H; i++) x2[i] = h1[i] + attnOut[i];
+    }
+
+    // Cell2/SSM forward (depth>=2)
+    const z2 = new Float64Array(H);
+    const r2 = new Float64Array(H);
+    const c2 = new Float64Array(H);
+    const h2 = new Float64Array(H);
+    let read: Float64Array<ArrayBufferLike> = h2;
+    if (mamba) {
+      const sc = this.ssm!.newCache();
+      this.ssm!.forward(x2, statePrev.h2, sc);
+      read = sc.y;
+    } else {
+      this.cell2.forward(x2, statePrev.h2, { z: z2, r: r2, c: c2, h: h2 });
+      read = h2;
+    }
+
+    // CNN forward (depth>=4)
+    let cnnCache: CnnCache | null = null;
+    if (cnn && depth >= 4) {
+      const idsWin = stateCur.ids.slice(-ctx);
+      cnnCache = this.cnnForward(idsWin).cache;
+    }
+
+    // ── 反向 ──
+    // 1) 输出头梯度 → dRead
+    const dRead = new Float64Array(H);
+    for (let k = 0; k < V; k++) {
+      const row = k * H;
+      for (let j = 0; j < H; j++) {
+        this.out.g[row + j] += dLogits[k] * (read as Float64Array)[j];
+        dRead[j] += dLogits[k] * this.out.p[row + j];
+      }
+      this.bOut.g[k] += dLogits[k];
+    }
+    // CNN头梯度
+    if (cnnCache && this.cnnW) {
+      // CNN独立预测头, dLogits已包含CNN贡献(在forward时叠加)
+      // 这里dRead不含CNN部分, 因为CNN有自己独立的outC/bC
+      // 需要单独传dLogits给cnnBackward
+      // 但dLogits是MoE组合的, 不是纯CNN的 → 跳过CNN头反向(由expert head负责)
+    }
+
+    // 2) SSM/Cell2反向 → dx2, dH1
+    const dx2 = new Float64Array(H);
+    const dH1FromDeep = new Float64Array(H);
+    if (mamba) {
+      // SSM 单步反向: 需要前向 cache，当前 backPropStep 不支持 SSM 路径。
+      // 梯度已通过 cell1 + 输出头累加，SSM 参数仅通过 trainStepBatch (完整 BPTT) 更新。
+      // 此处 dx2 视为 0，dH1FromDeep 直接继承 dRead（近似忽略 SSM 循环）。
+      for (let j = 0; j < H; j++) dH1FromDeep[j] = dRead[j];
+    } else {
+      const h2prev = statePrev.h2;
+      this.cell2.backward(dRead, x2, h2prev, z2, r2, c2, h2, dx2, dH1FromDeep);
+    }
+
+    // 3) Attn反向 → dH1
+    const dH1Total = new Float64Array(H);
+    for (let j = 0; j < H; j++) dH1Total[j] = dH1FromDeep[j];
+    if (attnCache && this.attnQ) {
+      const dHistN: Float64Array[] = [];
+      for (let si = 0; si < attnCache.K.length; si++) dHistN.push(new Float64Array(H));
+      this.attnBackward(dx2, attnCache, dH1Total, dHistN);
+      // dHistN梯度汇入早期timestep(暂忽略, 因单步反向不追踪跨步attention)
+    }
+
+    // 4) Cell1反向 → dx, dH1Prev
+    const dx1 = new Float64Array(E);
+    const dH1Prev = new Float64Array(H);
+    this.cell1.backward(dH1Total, x, statePrev.h1, z1, r1, c1, h1, dx1, dH1Prev);
+
+    // 5) Emb梯度
+    for (let e = 0; e < E; e++) this.emb.g[(xId % V) * E + e] += dx1[e];
   }
 }

@@ -7,18 +7,18 @@
   "scripts": {
     "build": "tsc",
     "dev": "tsc -w",
-    "train": "npm run build && node dist/ml/train.js",
-    "generate": "npm run build && node dist/ml/generate.js",
-    "ingest": "npm run build && node dist/ml/ingest.js",
-    "server": "npm run build && node dist/server/index.js",
+    "train": "npm run build && node sandbox/dist/ml/train.js",
+    "train:rl": "npm run build && node sandbox/dist/ml/train_rl.js",
+    "generate": "npm run build && node sandbox/dist/ml/generate.js",
+    "ingest": "npm run build && node sandbox/dist/ml/ingest.js",
+    "server": "npm run build && node sandbox/dist/server/index.js",
     "start": "npm run server",
-    "station:demo": "npm run build && node dist/station/demo.js",
+    "station:demo": "npm run build && node sandbox/dist/station/demo.js",
     "watchdog": "npm run build && node sandbox/dist/ml/watchdog.js",
     "watchdog:once": "npm run build && node sandbox/dist/ml/watchdog.js --once",
     "watchdog:resume": "npm run build && node sandbox/dist/ml/watchdog.js --resume"
   },
   "dependencies": {
-    "@tensorflow/tfjs-node": "^4.22.0",
     "express": "^4.21.2"
   },
   "devDependencies": {
